@@ -131,6 +131,171 @@ function is_production_environment() {
 }
 
 
+/**
+ * Guardar datos del pedido en múltiples ubicaciones para redundancia
+ */
+function guardar_datos_pedido($order_id, $reserva_data) {
+    error_log('=== GUARDANDO DATOS DEL PEDIDO (MEJORADO) ===');
+    error_log("Order ID: $order_id");
+    
+    // Método 1: Session (si está disponible)
+    if (!session_id() && !headers_sent()) {
+        session_start();
+    }
+    
+    if (session_id()) {
+        if (!isset($_SESSION['pending_orders'])) {
+            $_SESSION['pending_orders'] = array();
+        }
+        $_SESSION['pending_orders'][$order_id] = $reserva_data;
+        error_log('✅ Guardado en sesión');
+    }
+    
+    // Método 2: Transient (24 horas)
+    set_transient('redsys_order_' . $order_id, $reserva_data, 24 * HOUR_IN_SECONDS);
+    error_log('✅ Guardado en transient (24h)');
+    
+    // Método 3: Option (backup)
+    update_option('pending_order_' . $order_id, $reserva_data, 'no');
+    error_log('✅ Guardado en option (24h)');
+    
+    // Método 4: Base de datos (más confiable)
+    global $wpdb;
+    $table_pending = $wpdb->prefix . 'reservas_pending_orders';
+    
+    // Verificar que la tabla existe
+    if ($wpdb->get_var("SHOW TABLES LIKE '$table_pending'") == $table_pending) {
+        $result = $wpdb->replace(
+            $table_pending,
+            array(
+                'order_id' => $order_id,
+                'order_data' => json_encode($reserva_data),
+                'created_at' => current_time('mysql')
+            ),
+            array('%s', '%s', '%s')
+        );
+        
+        if ($result !== false) {
+            error_log('✅ Guardado en BD');
+        } else {
+            error_log('❌ Error guardando en BD: ' . $wpdb->last_error);
+        }
+    } else {
+        error_log('⚠️ Tabla de pedidos pendientes no existe');
+    }
+    
+    // Programar limpieza después de 24 horas
+    wp_schedule_single_event(time() + (24 * HOUR_IN_SECONDS), 'delete_pending_order', array($order_id));
+    
+    error_log('✅ Datos guardados en 4 ubicaciones para order: ' . $order_id);
+}
+
+/**
+ * Recuperar datos del pedido desde múltiples ubicaciones
+ */
+function recuperar_datos_pedido($order_id) {
+    error_log('=== RECUPERANDO DATOS DEL PEDIDO ===');
+    error_log("Order ID: $order_id");
+    
+    // Intento 1: Session
+    if (session_id() && isset($_SESSION['pending_orders'][$order_id])) {
+        error_log('✅ Datos encontrados en sesión');
+        return $_SESSION['pending_orders'][$order_id];
+    }
+    
+    // Intento 2: Transient
+    $data = get_transient('redsys_order_' . $order_id);
+    if ($data !== false) {
+        error_log('✅ Datos encontrados en transient');
+        return $data;
+    }
+    
+    // Intento 3: Option
+    $data = get_option('pending_order_' . $order_id);
+    if ($data !== false) {
+        error_log('✅ Datos encontrados en option');
+        return $data;
+    }
+    
+    // Intento 4: Base de datos
+    global $wpdb;
+    $table_pending = $wpdb->prefix . 'reservas_pending_orders';
+    
+    $row = $wpdb->get_row($wpdb->prepare(
+        "SELECT order_data FROM $table_pending WHERE order_id = %s",
+        $order_id
+    ));
+    
+    if ($row) {
+        error_log('✅ Datos encontrados en BD');
+        return json_decode($row->order_data, true);
+    }
+    
+    error_log('❌ No se encontraron datos para order: ' . $order_id);
+    return null;
+}
+
+/**
+ * Enviar alerta de pago perdido al administrador
+ */
+function send_lost_payment_alert($order_id, $redsys_params, $reservation_data) {
+    error_log('=== ENVIANDO ALERTA DE PAGO PERDIDO ===');
+    
+    $admin_email = get_option('admin_email');
+    $subject = '⚠️ ALERTA: Pago procesado pero reserva no creada - Order: ' . $order_id;
+    
+    $message = "Se detectó un pago exitoso en Redsys pero la reserva no se creó correctamente.\n\n";
+    $message .= "INFORMACIÓN DEL PEDIDO:\n";
+    $message .= "Order ID: " . $order_id . "\n";
+    $message .= "Fecha/Hora: " . current_time('mysql') . "\n\n";
+    
+    if ($redsys_params) {
+        $message .= "DATOS DE REDSYS:\n";
+        $message .= print_r($redsys_params, true) . "\n\n";
+    }
+    
+    if ($reservation_data) {
+        $message .= "DATOS DE LA RESERVA:\n";
+        $message .= "Fecha: " . ($reservation_data['fecha'] ?? 'N/A') . "\n";
+        $message .= "Hora: " . ($reservation_data['hora_ida'] ?? 'N/A') . "\n";
+        $message .= "Servicio ID: " . ($reservation_data['service_id'] ?? 'N/A') . "\n";
+        $message .= "Adultos: " . ($reservation_data['adultos'] ?? 0) . "\n";
+        $message .= "Residentes: " . ($reservation_data['residentes'] ?? 0) . "\n";
+        $message .= "Niños 5-12: " . ($reservation_data['ninos_5_12'] ?? 0) . "\n";
+        $message .= "Niños <5: " . ($reservation_data['ninos_menores'] ?? 0) . "\n";
+        $message .= "Precio Total: " . ($reservation_data['total_price'] ?? 'N/A') . "€\n";
+        $message .= "Nombre: " . ($reservation_data['nombre'] ?? 'N/A') . "\n";
+        $message .= "Email: " . ($reservation_data['email'] ?? 'N/A') . "\n";
+        $message .= "Teléfono: " . ($reservation_data['telefono'] ?? 'N/A') . "\n";
+    }
+    
+    $message .= "\n\nACCIONES NECESARIAS:\n";
+    $message .= "1. Verificar en el TPV de Redsys que el pago se procesó correctamente\n";
+    $message .= "2. Revisar los logs del servidor para el error 500\n";
+    $message .= "3. Crear la reserva manualmente si es necesario\n";
+    $message .= "4. Contactar al cliente para confirmar\n";
+    
+    $headers = array('Content-Type: text/plain; charset=UTF-8');
+    
+    $sent = wp_mail($admin_email, $subject, $message, $headers);
+    
+    if ($sent) {
+        error_log('✅ Alerta enviada a: ' . $admin_email);
+    } else {
+        error_log('❌ Error enviando alerta');
+    }
+    
+    // También guardar en un log especial
+    $log_file = WP_CONTENT_DIR . '/lost-payments.log';
+    $log_entry = "\n\n=== " . current_time('mysql') . " ===\n";
+    $log_entry .= "Order ID: " . $order_id . "\n";
+    $log_entry .= "Redsys Params: " . json_encode($redsys_params) . "\n";
+    $log_entry .= "Reservation Data: " . json_encode($reservation_data) . "\n";
+    
+    file_put_contents($log_file, $log_entry, FILE_APPEND);
+}
+
+
 
 function process_successful_payment($order_id, $redsys_params) {
     error_log('=== PROCESANDO PAGO EXITOSO ===');
@@ -147,24 +312,43 @@ function process_successful_payment($order_id, $redsys_params) {
     ));
 
     if ($existing) {
-        error_log("⚠️ Ya existe reserva para order_id: $order_id");
-        return true;
+        error_log("⚠️ Ya existe reserva para order_id: $order_id (ID: $existing)");
+        return true; // Ya procesado, devolver éxito
     }
 
-    // Obtener datos del pedido guardados
-    if (!session_id()) {
-        session_start();
+    // Recuperar datos del pedido
+    if (!function_exists('recuperar_datos_pedido')) {
+        require_once RESERVAS_PLUGIN_PATH . 'includes/redsys-helper.php';
     }
     
-    $reservation_data = $_SESSION['pending_orders'][$order_id] ?? null;
+    $reservation_data = recuperar_datos_pedido($order_id);
     
     if (!$reservation_data) {
         error_log("❌ No se encontraron datos para order_id: $order_id");
+        
+        // Intentar buscar en todas las ubicaciones posibles
+        error_log('🔍 Buscando en todas las ubicaciones...');
+        
+        // Listar todos los transients que contengan 'redsys_order'
+        $transient_keys = $wpdb->get_col(
+            "SELECT option_name FROM {$wpdb->options} 
+             WHERE option_name LIKE '_transient_redsys_order_%'"
+        );
+        error_log('Transients encontrados: ' . print_r($transient_keys, true));
+        
+        // Si no encontramos nada, enviar alerta
+        if (!function_exists('send_lost_payment_alert')) {
+            require_once RESERVAS_PLUGIN_PATH . 'includes/redsys-helper.php';
+        }
+        send_lost_payment_alert($order_id, $redsys_params, null);
+        
         return false;
     }
 
+    error_log('✅ Datos de reserva recuperados: ' . print_r($reservation_data, true));
+
     try {
-        // Procesar la reserva usando la clase existente
+        // Procesar la reserva
         if (!class_exists('ReservasProcessor')) {
             require_once RESERVAS_PLUGIN_PATH . 'includes/class-reservas-processor.php';
         }
@@ -188,16 +372,27 @@ function process_successful_payment($order_id, $redsys_params) {
             error_log("✅ Reserva procesada exitosamente: " . $result['data']['localizador']);
             
             // Limpiar datos temporales
-            unset($_SESSION['pending_orders'][$order_id]);
+            if (session_id() && isset($_SESSION['pending_orders'][$order_id])) {
+                unset($_SESSION['pending_orders'][$order_id]);
+            }
+            delete_transient('redsys_order_' . $order_id);
+            delete_option('pending_order_' . $order_id);
+            
+            // Limpiar de BD
+            $table_pending = $wpdb->prefix . 'reservas_pending_orders';
+            $wpdb->delete($table_pending, array('order_id' => $order_id));
             
             return true;
         } else {
             error_log("❌ Error procesando reserva: " . $result['message']);
+            send_lost_payment_alert($order_id, $redsys_params, $reservation_data);
             return false;
         }
 
     } catch (Exception $e) {
         error_log("❌ Excepción procesando pago: " . $e->getMessage());
+        error_log("Stack trace: " . $e->getTraceAsString());
+        send_lost_payment_alert($order_id, $redsys_params, $reservation_data);
         return false;
     }
 }

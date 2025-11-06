@@ -2739,21 +2739,18 @@ function debug_redsys_flow()
         'recent_reservas' => $recent_reservas
     ));
 }
-// CORRECCIÓN EN sistema-reservas.php - función handle_redsys_notification()
 
 function handle_redsys_notification()
 {
-    // ✅ AÑADIR LOGS MÁS DETALLADOS Y MANEJO DE ERRORES MEJORADO
     error_log('=== NOTIFICACIÓN REDSYS RECIBIDA ===');
     error_log('Time: ' . date('Y-m-d H:i:s'));
     error_log('IP: ' . ($_SERVER['REMOTE_ADDR'] ?? 'unknown'));
     error_log('POST: ' . print_r($_POST, true));
+    error_log('PHP Version: ' . PHP_VERSION);
+    error_log('Memory Limit: ' . ini_get('memory_limit'));
     
-    // ✅ ASEGURAR QUE LA SESIÓN ESTÉ INICIADA ANTES DE PROCESAR
-    if (!session_id() && !headers_sent()) {
-        session_start();
-    }
-
+    // NO iniciar sesión aquí - causa problemas con headers
+    
     try {
         $params = $_POST['Ds_MerchantParameters'] ?? '';
         $signature = $_POST['Ds_Signature'] ?? '';
@@ -2770,10 +2767,10 @@ function handle_redsys_notification()
 
         $redsys = new RedsysAPI();
         
-        // ✅ AÑADIR TRY-CATCH PARA DECODIFICACIÓN
         try {
             $decoded = $redsys->getParametersFromResponse($params);
             error_log('✅ Parámetros decodificados correctamente');
+            error_log('Decoded params: ' . print_r($decoded, true));
         } catch (Exception $e) {
             error_log('❌ Error decodificando parámetros: ' . $e->getMessage());
             status_header(400);
@@ -2802,18 +2799,19 @@ function handle_redsys_notification()
 
         error_log('✅ Pago exitoso, procesando...');
 
-        // ✅ CARGAR FUNCIÓN CON VERIFICACIÓN
+        // Cargar handler
         if (!function_exists('process_successful_payment')) {
             $handler_path = RESERVAS_PLUGIN_PATH . 'includes/class-redsys-handler.php';
             if (!file_exists($handler_path)) {
                 error_log('❌ ERROR CRÍTICO: No existe class-redsys-handler.php');
+                send_lost_payment_alert($order_id, $decoded, null);
                 status_header(500);
                 exit('ERROR: Handler not found');
             }
             require_once $handler_path;
         }
 
-        // ✅ PROCESAR CON MANEJO DE ERRORES COMPLETO
+        // Procesar pago
         try {
             $ok = process_successful_payment($order_id, $decoded);
             
@@ -2823,7 +2821,6 @@ function handle_redsys_notification()
                 echo 'OK';
             } else {
                 error_log("❌ Fallo procesando reserva - Order: $order_id");
-                // ✅ ENVIAR EMAIL DE ALERTA INMEDIATAMENTE
                 send_lost_payment_alert($order_id, $decoded, null);
                 status_header(500);
                 echo 'ERROR: Processing failed';
